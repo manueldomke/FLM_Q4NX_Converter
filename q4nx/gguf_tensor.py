@@ -355,19 +355,125 @@ class GGUFTensor:
         w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
         return w
 
+    def _requantize(self, ziel: GGMLQuantizationType):
+        """Quellgewichte dequantisieren und ins Zielformat bringen.
+
+        Wird genommen, wenn Quell- und Zielformat auseinandergehen. Der
+        Qualitaetsverlust dabei ist real -- der Kommentar am Aufrufer beziffert
+        ihn mit 0.240 Bit ENOB --, aber ein Modell im falschen Pufferformat
+        laedt gar nicht erst.
+        """
+        w = np.asarray(dequantize(self.data, self.tensor_type), dtype=np.float32)
+        # Nur echte Matrizen auf (Zeilen, Spalten) bringen. ssm_a, ssm_dt und
+        # ssm_norm sind Vektoren, und ein reshape(-1, n) macht daraus (1, n) --
+        # die Umformungen weiter unten erwarten aber einen Vektor und brechen
+        # sonst mit "rearrange-reduction pattern" ab.
+        if w.ndim != 1 or len(self.shape) != 1:
+            w = w.reshape(-1, self.shape[0])
+
+        if ziel == GGMLQuantizationType.Q4_K:
+            return GGUFTensor.quantize_to_q4_k_triple(w, self.shape[0])
+        if ziel in (GGMLQuantizationType.BF16, GGMLQuantizationType.F16,
+                    GGMLQuantizationType.F32):
+            return [torch.from_numpy(w.copy()).to(torch.bfloat16)]
+
+        data_quantized = quantize(w, ziel).copy()
+        if ziel == GGMLQuantizationType.Q4_1:
+            return self.unpack_q4_1(data_quantized, self.shape[0])
+        if ziel == GGMLQuantizationType.Q4_0:
+            return self.unpack_q4_0(data_quantized, self.shape[0])
+        if ziel == GGMLQuantizationType.Q8_0:
+            return self.unpack_q8_0(data_quantized, self.shape[0])
+        raise ValueError(f"Kein Encoder fuer {ziel.name}")
+
+    @staticmethod
+    def quantize_to_q4_k_triple(w: np.ndarray, columns: int
+                                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gewichte nach Q4_K quantisieren, in der Form, die _pack_q4k erwartet.
+
+        Das Gegenstueck zu unpack_q4_k: dort wird ein Q4_K-Block gelesen und in
+        seine Bestandteile zerlegt, hier werden die Bestandteile aus rohen
+        Gewichten erzeugt. Der Kommentar am Aufrufer behauptete jahrelang, das
+        gehe nicht -- "nothing can encode Q4_K". Gemeint war: ggmls quantize()
+        hat keinen Q4_K-Encoder. Er ist aber zwanzig Zeilen lang, denn Q4_K ist
+        nur eine affine Quantisierung ueber 32er-Gruppen mit einem gemeinsamen
+        Minimum:
+
+            w = t_j * q - u_j        mit q in [0, 15]
+
+        flm erwartet genau diese Zerlegung. t_j ist der effektive Gruppenskalar,
+        u_j das subtrahierte Minimum, und beides muss nicht negativ sein -- der
+        Spaeter folgende Refit legt sie auf (BF16, uint8) um.
+
+        Der Unterschied zu Q4_1 ist nicht die Form, sondern die Bedeutung: dort
+        ist m ein vorzeichenbehaftetes Minimum, hier ist u eine subtrahierte
+        nichtnegative Groesse. Deshalb ergibt dieselbe Zeilenbreite verschiedene
+        Puffergroessen -- 4736 Byte bei Q4_K gegen 5120 bei Q4_1.
+
+        Returns
+        -------
+        t (rows, columns // 32), u (rows, columns // 32), q (rows, columns)
+        """
+        group = 32
+        rows = w.shape[0] // columns if w.ndim == 1 else w.shape[0]
+        wg = w.reshape(rows, columns // group, group)
+
+        # lo auf hoechstens 0 ziehen: u = -lo muss nicht negativ bleiben, sonst
+        # kann der Refit es nicht als uint8 ablegen. Kostet bei Gruppen, die
+        # ganz im Positiven liegen, etwas Aufloesung -- aber nur dort.
+        lo = np.minimum(wg.min(axis=2), 0.0)
+        hi = wg.max(axis=2)
+        t = (hi - lo) / 15.0
+        t[t <= 0.0] = 1e-8          # konstante Gruppe: Skalar 0 waere nicht teilbar
+        u = -lo
+
+        q = np.rint((wg + u[:, :, None]) / t[:, :, None])
+        q = np.clip(q, 0.0, 15.0).reshape(rows, columns)
+
+        return (torch.from_numpy(t.astype(np.float32)).contiguous(),
+                torch.from_numpy(u.astype(np.float32)).contiguous(),
+                torch.from_numpy(q.astype(np.float32)).contiguous())
+
     def get_used_quantization_type(self, default_tensor_type: GGMLQuantizationType) -> GGMLQuantizationType:
-        
-        if self.tensor_type in [GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16, GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q8_0, GGMLQuantizationType.MXFP4, GGMLQuantizationType.Q4_K]:
-            return self.tensor_type
-        else:
-            # For unsupported types, we will dequantize and then quantize to default_tensor_type.
-            # Q4_K is a read-only format here -- nothing can encode into it -- so a
-            # config asking for it as the fallback target gets Q4_1 instead.
-            if default_tensor_type == GGMLQuantizationType.Q4_K:
-                return GGMLQuantizationType.Q4_1
-            return default_tensor_type
+
+        # Der Zieltyp kommt aus der Konfiguration -- immer.
+        #
+        # Am 11.10.2026 stand hier das Gegenteil: war der Quelltyp ein bekanntes
+        # Format, wurde er unveraendert uebernommen und der Zieltyp nur als
+        # Rueckfall benutzt. Fuer ein Qwen3.5-4B scheiterte das an zwei Stellen:
+        #
+        #   Q6_K-Tensoren (qkv_proj, down_proj) fielen in den else-Zweig, und
+        #   weil "nothing can encode Q4_K" galten sie als Q4_1 -- 5120 Byte je
+        #   Zeile statt der 4736, auf die flm seine Puffer bemisst.
+        #
+        #   ssm_alpha_proj und ssm_beta_proj stehen im Q4_K_M-GGUF als Q4_K,
+        #   die Konfiguration fordert aber Q8_0 (8704). Der erste Zweig behielt
+        #   Q4_K und ueberging die Konfiguration -- dieselbe Zeile, andere
+        #   Richtung.
+        #
+        # Beides zusammen ergab ein Modell, das lud und fuer jede Eingabe
+        # dieselbe Konstante ausgab. Jetzt entscheidet die Konfiguration, und
+        # unpack nimmt den direkten Lesepfad nur noch, wenn Quelle und Ziel
+        # ohnehin gleich sind.
+        return default_tensor_type
 
     def unpack(self, default_tensor_type: GGMLQuantizationType) -> np.ndarray:
+        # Der Zieltyp kommt aus der Konfiguration, nicht aus der Quelle.
+        #
+        # Am 11.10.2026 stand hier das Gegenteil: stand der Quelltyp in einer
+        # Liste bekannter Formate, wurde er unveraendert uebernommen und der
+        # Zieltyp nur als Rueckfall benutzt. Fuer ein Qwen3.5-4B hiess das, dass
+        # ssm_alpha_proj und ssm_beta_proj -- im Q4_K_M-GGUF als Q4_K abgelegt,
+        # in der Konfiguration aber als Q8_0 gefordert -- mit 4736 Byte je Zeile
+        # gepackt wurden statt mit den 8704, die flm dort erwartet.
+        #
+        # Der direkte Lesepfad bleibt erhalten, aber nur wenn Quelle und Ziel
+        # uebereinstimmen: er vermeidet Dequantisieren und Neuquantisieren und
+        # damit den Qualitaetsverlust, den der Kommentar weiter unten beschreibt.
+        # Stimmen sie nicht ueberein, wird umgerechnet.
+        if default_tensor_type != self.tensor_type:
+            return self._requantize(default_tensor_type)
+
         if self.tensor_type == GGMLQuantizationType.F32:
             return [torch.Tensor(np.array(self.data.view(np.float32)))]
         elif self.tensor_type == GGMLQuantizationType.F16:
@@ -391,12 +497,14 @@ class GGUFTensor:
                 This is a workaround for the fact that the GGUF format does not support all tensor types
                 and we need to convert it to a supported type before converting to Q4NX
             """
+            # Hierher kommt nur noch, wer Quell- und Zielformat gemeinsam hat
+            # (sonst greift _requantize oben) und dessen Format trotzdem keinen
+            # direkten Lesepfad besitzt. Q4_K hat einen und kommt deshalb nie an.
+            #
             # Q4_K does not come here: it has a direct path above. Stacking a
             # dequantize onto a re-quantize costs 0.240 bits of ENOB *and* 0.375
             # bpw against reading it natively, and damages the tail far more than
-            # the mean (see quant.md).  q5/q6 still take this path.
-            if default_tensor_type == GGMLQuantizationType.Q4_K:
-                default_tensor_type = GGMLQuantizationType.Q4_1  # nothing can encode Q4_K
+            # the mean (see quant.md).
             if default_tensor_type in (GGMLQuantizationType.BF16, GGMLQuantizationType.F16,
                                        GGMLQuantizationType.F32):
                 # An unquantized target only needs the dequantize; ggml's quantize()

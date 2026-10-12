@@ -47,8 +47,19 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 print(f"Processing tensor: {gguf_tensor.name} with type {gguf_tensor.tensor_type.name} -> {self.forward_name_map[gguf_tensor.name]} with dtype {target_dtype.name}")
                 if "token_embd.weight" in gguf_tensor.name: # this should be bf16
                     if tied_embedding:
-                        # lm_head.weight above already carries these weights; skip the bf16 duplicate
-                        print("[INFO] Tied embedding, skipping bf16 copy of token_embd.weight")
+                        # lm_head.weight oben traegt die quantisierte Fassung. Die
+                        # Einbettung muss trotzdem unter ihrem eigenen Namen in der
+                        # Datei stehen -- flm sucht model.embed_tokens.weight und
+                        # rechnet ohne sie auf einer leeren Eingabe. Am 11.10.2026
+                        # kam dabei eine Konstante heraus ('///' fuer jede Eingabe),
+                        # obwohl das Modell lud.
+                        #
+                        # Vorher stand hier ein continue, das den ganzen Block
+                        # uebersprang statt nur die Doppelung zu vermeiden.
+                        w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
+                        w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
+                        self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = w
+                        print("[INFO] Tied embedding: model.embed_tokens.weight als BF16 geschrieben")
                         continue
                     w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
                     w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
@@ -126,9 +137,28 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                         if reorder_linear_required:
                             w = rearrange(w, '(q g) c -> (g q) c', q = 2).contiguous()
 
-                        # new_name = self.forward_name_map[gguf_tensor.name]
-                        # new_name = new_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
-                        # self.q4nx_tensors[new_name] = w  sdfsdf
+                        # bf16-Kopie fuer den Prefill-Pfad speichern.
+
+
+                        # Am 11.10.2026 waren diese drei Zeilen auskommentiert (samt
+
+
+                        # Debug-Rest 'sdfsdf'). Folge: model.q4nx enthielt kein
+
+
+                        # ssm_alpha_proj.bf16.weight, und flm brach beim Laden ab mit
+
+
+                        #   Weight not found: model.layers.0.linear_attn.ssm_alpha_proj.bf16.weight
+
+
+                        new_name = self.forward_name_map[gguf_tensor.name]
+
+
+                        new_name = new_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
+
+
+                        self.q4nx_tensors[new_name] = w
                         if reorder_linear_required:
                             print(f"[INFO] Reorder for {self.forward_name_map[gguf_tensor.name]}")
                             d = rearrange(d, '(q g) c -> (g q) c', q = 2).contiguous()
